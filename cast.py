@@ -132,10 +132,9 @@ def cast(args):
 	import threading
 	import time
 
-	if args.device is not None:
-		cast = pychromecast.get_chromecast(strict=True, friendly_name=args.device)
-	else:
-		cast = pychromecast.get_chromecast(strict=True)
+	# todo: blocking=False
+	(cast,) = (cc for cc in pychromecast.get_chromecasts()
+	           if args.device is None or args.device == cc.device.friendly_name)
 
 	controller = cast.media_controller
 	#yt_controller = pychromecast.controllers.youtube.YouTubeController()
@@ -177,9 +176,18 @@ def cast(args):
 				#while yt_controller.screen_id is not None:
 				#	time.sleep(1)
 			else:
+				completion = threading.Event()
+				class status_listener:
+					def new_media_status(status):
+						if status.player_is_idle:
+							completion.set()
+
+				controller.register_status_listener(status_listener())
 				controller.play_media(url, filetype)
-				while not controller.status.player_is_idle:
-					time.sleep(1)
+
+				# poll so signal handlers still work
+				while not completion.wait(0.5):
+					pass
 
 			time.sleep(args.wait)
 
