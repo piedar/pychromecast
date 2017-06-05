@@ -3,15 +3,17 @@ Provides a controller for controlling the default media players
 on the Chromecast.
 """
 from collections import namedtuple
+import threading
 
 from ..config import APP_MEDIA_RECEIVER
 from . import BaseController
 
 STREAM_TYPE_UNKNOWN = "UNKNOWN"
 STREAM_TYPE_BUFFERED = "BUFFERED"
-STREAM_TYPE_LIVE = "LIFE"
+STREAM_TYPE_LIVE = "LIVE"
 
 MEDIA_PLAYER_STATE_PLAYING = "PLAYING"
+MEDIA_PLAYER_STATE_BUFFERING = "BUFFERING"
 MEDIA_PLAYER_STATE_PAUSED = "PAUSED"
 MEDIA_PLAYER_STATE_IDLE = "IDLE"
 MEDIA_PLAYER_STATE_UNKNOWN = "UNKNOWN"
@@ -64,6 +66,7 @@ class MediaStatus(object):
         self.media_custom_data = {}
         self.media_metadata = {}
         self.subtitle_tracks = {}
+        self.current_subtitle_tracks = []
 
     @property
     def metadata_type(self):
@@ -73,7 +76,8 @@ class MediaStatus(object):
     @property
     def player_is_playing(self):
         """ Return True if player is PLAYING. """
-        return self.player_state == MEDIA_PLAYER_STATE_PLAYING
+        return (self.player_state == MEDIA_PLAYER_STATE_PLAYING or
+                self.player_state == MEDIA_PLAYER_STATE_BUFFERING)
 
     @property
     def player_is_paused(self):
@@ -226,6 +230,8 @@ class MediaStatus(object):
             'customData', self.media_custom_data)
         self.media_metadata = media_data.get('metadata', self.media_metadata)
         self.subtitle_tracks = media_data.get('tracks', self.subtitle_tracks)
+        self.current_subtitle_tracks = status_data.get(
+            'activeTrackIds', self.current_subtitle_tracks)
 
     def __repr__(self):
         info = {
@@ -251,6 +257,7 @@ class MediaStatus(object):
         return '<MediaStatus {}>'.format(info)
 
 
+# pylint: disable=too-many-public-methods
 class MediaController(BaseController):
     """ Controller to interact with Google media namespace. """
 
@@ -260,7 +267,8 @@ class MediaController(BaseController):
 
         self.media_session_id = 0
         self.status = MediaStatus()
-
+        self.session_active_event = threading.Event()
+        self.app_id = APP_MEDIA_RECEIVER
         self._status_listeners = []
 
     def channel_connected(self):
@@ -287,14 +295,17 @@ class MediaController(BaseController):
             call listener.new_media_status(status) """
         self._status_listeners.append(listener)
 
-    def update_status(self, blocking=False):
+    def update_status(self, callback_function_param=False):
         """ Send message to update the status. """
         self.send_message({MESSAGE_TYPE: TYPE_GET_STATUS},
-                          wait_for_response=blocking)
+                          callback_function=callback_function_param)
 
     def _send_command(self, command):
         """ Send a command to the Chromecast on media channel. """
         if self.status is None or self.status.media_session_id is None:
+            self.logger.warning(
+                "%s command requested but no session is active.",
+                command[MESSAGE_TYPE])
             return
 
         command['mediaSessionId'] = self.status.media_session_id
@@ -376,11 +387,32 @@ class MediaController(BaseController):
             "activeTrackIds": []
         })
 
+    def block_until_active(self, timeout=None):
+        """
+        Blocks thread until the media controller session is active on the
+        chromecast. The media controller only accepts playback control
+        commands when a media session is active.
+
+        If a session is already active then the method returns immediately.
+
+        :param timeout: a floating point number specifying a timeout for the
+                        operation in seconds (or fractions thereof). Or None
+                        to block forever.
+        """
+        self.session_active_event.wait(timeout=timeout)
+
     def _process_media_status(self, data):
         """ Processes a STATUS message. """
         self.status.update(data)
 
         self.logger.debug("Media:Received status %s", data)
+
+        # Update session active threading event
+        if self.status.media_session_id is None:
+            self.session_active_event.clear()
+        else:
+            self.session_active_event.set()
+
         self._fire_status_changed()
 
     def _fire_status_changed(self):
@@ -395,7 +427,8 @@ class MediaController(BaseController):
     def play_media(self, url, content_type, title=None, thumb=None,
                    current_time=0, autoplay=True,
                    stream_type=STREAM_TYPE_BUFFERED,
-                   metadata=None):
+                   metadata=None, subtitles=None, subtitles_lang='en-US',
+                   subtitles_mime='text/vtt', subtitle_id=1):
         """
         Plays media on the Chromecast. Start default media receiver if not
         already started.
@@ -410,6 +443,10 @@ class MediaController(BaseController):
         autoplay: bool - whether the media will automatically play.
         stream_type: str - describes the type of media artifact as one of the
             following: "NONE", "BUFFERED", "LIVE".
+        subtitles: str - url of subtitle file to be shown on chromecast.
+        subtitles_lang: str - language for subtitles.
+        subtitles_mime: str - mimetype of subtitles.
+        subtitle_id: int - id of subtitle to be loaded.
         metadata: dict - media metadata object, one of the following:
             GenericMediaMetadata, MovieMediaMetadata, TvShowMediaMetadata,
             MusicTrackMediaMetadata, PhotoMediaMetadata.
@@ -417,14 +454,30 @@ class MediaController(BaseController):
         Docs:
         https://developers.google.com/cast/docs/reference/messages#MediaData
         """
+        def app_launched_callback():
+            """Plays media after chromecast has switched to requested app."""
+            self._send_start_play_media(
+                url, content_type, title, thumb, current_time, autoplay,
+                stream_type, metadata, subtitles, subtitles_lang,
+                subtitles_mime, subtitle_id)
 
-        self._socket_client.receiver_controller.launch_app(APP_MEDIA_RECEIVER)
+        receiver_ctrl = self._socket_client.receiver_controller
+        receiver_ctrl.launch_app(self.app_id,
+                                 callback_function=app_launched_callback)
+
+    def _send_start_play_media(self, url, content_type, title=None, thumb=None,
+                               current_time=0, autoplay=True,
+                               stream_type=STREAM_TYPE_BUFFERED,
+                               metadata=None, subtitles=None,
+                               subtitles_lang='en-US',
+                               subtitles_mime='text/vtt', subtitle_id=1):
 
         msg = {
             'media': {
                 'contentId': url,
                 'streamType': stream_type,
                 'contentType': content_type,
+                'metadata': metadata or {}
             },
             MESSAGE_TYPE: TYPE_LOAD,
             'currentTime': current_time,
@@ -433,20 +486,32 @@ class MediaController(BaseController):
         }
 
         if title:
-            if 'payload' not in msg['customData']:
-                msg['customData']['payload'] = {}
-
-            msg['customData']['payload']['title'] = title
+            msg['media']['metadata']['title'] = title
 
         if thumb:
-            if 'payload' not in msg['customData']:
-                msg['customData']['payload'] = {}
+            msg['media']['metadata']['thumb'] = thumb
 
-            msg['customData']['payload']['thumb'] = thumb
+            if 'images' not in msg['media']['metadata']:
+                msg['media']['metadata']['images'] = []
 
-        if metadata:
-            msg['media']['metadata'] = metadata
-
+            msg['media']['metadata']['images'].append({'url': thumb})
+        if subtitles:
+            sub_msg = [{
+                'trackId': subtitle_id,
+                'trackContentId': subtitles,
+                'language': subtitles_lang,
+                'subtype': 'SUBTITLES',
+                'type': 'TEXT',
+                'trackContentType': subtitles_mime,
+                'name': "{} - {} Subtitle".format(subtitles_lang, subtitle_id)
+                }]
+            msg['media']['tracks'] = sub_msg
+            msg['media']['textTrackStyle'] = {
+                'backgroundColor': '#FFFFFF00',
+                'edgeType': 'OUTLINE',
+                'edgeColor': '#000000FF'
+            }
+            msg['activeTrackIds'] = [subtitle_id]
         self.send_message(msg, inc_session_id=True)
 
     def tear_down(self):

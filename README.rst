@@ -15,8 +15,7 @@ currently supports:
 -  Easily extendable to add support for unsupported namespaces
 -  Multi-room setups with Audio cast devices
 
-*PyChromecast 0.6 introduces some backward incompatible changes due to
-the migration from DIAL to socket for retrieving the app status.*
+*Check out [Home Assistant](https://home-assistant.io) for a ready-made solution using PyChromecast for controlling and automating your Chromecast or Cast-enabled device like Google Home.*
 
 Dependencies
 ------------
@@ -40,10 +39,11 @@ How to use
     >> import time
     >> import pychromecast
 
-    >> pychromecast.get_chromecasts_as_dict().keys()
+    >> chromecasts = pychromecast.get_chromecasts()
+    >> [cc.device.friendly_name for cc in chromecasts]
     ['Dev', 'Living Room', 'Den', 'Bedroom']
 
-    >> cast = pychromecast.get_chromecast(friendly_name="Living Room")
+    >> cast = next(cc for cc in chromecasts if cc.device.friendly_name == "Living Room")
     >> # Wait for cast device to be ready
     >> cast.wait()
     >> print(cast.device)
@@ -54,6 +54,7 @@ How to use
 
     >> mc = cast.media_controller
     >> mc.play_media('http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4', 'video/mp4')
+    >> mc.block_until_active()
     >> print(mc.status)
     MediaStatus(current_time=42.458322, content_id=u'http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4', content_type=u'video/mp4', duration=596.474195, stream_type=u'BUFFERED', idle_reason=None, media_session_id=1, playback_rate=1, player_state=u'PLAYING', supported_media_commands=15, volume_level=1, volume_muted=False)
 

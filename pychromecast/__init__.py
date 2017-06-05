@@ -12,17 +12,15 @@ import threading
 from .config import *  # noqa
 from .error import *  # noqa
 from . import socket_client
-from .discovery import discover_chromecasts
+from .discovery import discover_chromecasts, start_discovery, stop_discovery
 from .dial import get_device_status, reboot, DeviceStatus, CAST_TYPES, \
     CAST_TYPE_CHROMECAST
 from .controllers.media import STREAM_TYPE_BUFFERED  # noqa
 
 __all__ = (
-    '__version__', '__version_info__',
-    'get_chromecasts', 'get_chromecasts_as_dict', 'get_chromecast',
-    'Chromecast'
+    '__version__', '__version_info__', 'get_chromecasts', 'Chromecast',
 )
-__version_info__ = ('0', '7', '1')
+__version_info__ = ('0', '7', '6')
 __version__ = '.'.join(__version_info__)
 
 IDLE_APP_ID = 'E8C28D3C'
@@ -31,50 +29,39 @@ IGNORE_CEC = []
 NON_UNICODE_REPR = sys.version_info < (3, )
 
 
-def _get_all_chromecasts(tries=None, retry_wait=None, timeout=None):
-    """
-    Returns a list of all chromecasts on the network as PyChromecast
-    objects.
-    """
-    hosts = discover_chromecasts()
-    cc_list = []
-    for ip_address, port, uuid, model_name, friendly_name in hosts:
-        try:
-            # Build device status from the mDNS info, this information is
-            # the primary source and the remaining will be fetched
-            # later on.
-            cast_type = CAST_TYPES.get(model_name.lower(),
-                                       CAST_TYPE_CHROMECAST)
-            device = DeviceStatus(
-                friendly_name=friendly_name, model_name=model_name,
-                manufacturer=None, api_version=None,
-                uuid=uuid, cast_type=cast_type,
-            )
-            cc_list.append(Chromecast(host=ip_address, port=port,
-                                      device=device,
-                                      tries=tries, timeout=timeout,
-                                      retry_wait=retry_wait))
-        except ChromecastConnectionError:
-            pass
-    return cc_list
+def _get_chromecast_from_host(host, tries=None, retry_wait=None, timeout=None,
+                              blocking=True):
+    """Creates a Chromecast object from a zeroconf host."""
+    # Build device status from the mDNS info, this information is
+    # the primary source and the remaining will be fetched
+    # later on.
+    ip_address, port, uuid, model_name, friendly_name = host
+    cast_type = CAST_TYPES.get(model_name.lower(),
+                               CAST_TYPE_CHROMECAST)
+    device = DeviceStatus(
+        friendly_name=friendly_name, model_name=model_name,
+        manufacturer=None, api_version=None,
+        uuid=uuid, cast_type=cast_type,
+    )
+    return Chromecast(host=ip_address, port=port, device=device, tries=tries,
+                      timeout=timeout, retry_wait=retry_wait,
+                      blocking=blocking)
 
 
-def get_chromecasts(tries=None, retry_wait=None, timeout=None, **filters):
+# pylint: disable=too-many-locals
+def get_chromecasts(tries=None, retry_wait=None, timeout=None,
+                    blocking=True, callback=None):
     """
-    Searches the network and returns a list of Chromecast objects.
-    Filter is a list of options to filter the chromecasts by.
+    Searches the network for chromecast devices.
+
+    If blocking = True, returns a list of discovered chromecast devices.
+    If blocking = False, triggers a callback for each discovered chromecast,
+                         and returns a function which can be executed to stop
+                         discovery.
 
     ex: get_chromecasts(friendly_name="Living Room")
 
-    May return an empty list if no chromecasts were found matching
-    the filter criteria
-
-    Filters include DeviceStatus items:
-        friendly_name, model_name, manufacturer, api_version
-    Or AppStatus items:
-        app_id, description, state, service_url, service_protocols (list)
-    Or ip address:
-        ip
+    May return an empty list if no chromecasts were found.
 
     Tries is specified if you want to limit the number of times the
     underlying socket associated with your Chromecast objects will
@@ -83,102 +70,39 @@ def get_chromecasts(tries=None, retry_wait=None, timeout=None, **filters):
     can be defined by passing the retry_wait parameter, the default is
     to wait 5 seconds.
     """
-    logger = logging.getLogger(__name__)
-
-    cc_list = set(_get_all_chromecasts(tries, retry_wait, timeout))
-    excluded_cc = set()
-
-    if not filters:
-        return list(cc_list)
-
-    if 'ip' in filters:
-        for chromecast in cc_list:
-            if chromecast.host != filters['ip']:
-                excluded_cc.add(chromecast)
-        filters.pop('ip')
-
-    for key, val in filters.items():
-        for chromecast in cc_list:
-            for tup in [chromecast.device, chromecast.status]:
-                if hasattr(tup, key) and val != getattr(tup, key):
-                    excluded_cc.add(chromecast)
-
-    filtered_cc = cc_list - excluded_cc
-
-    for cast in excluded_cc:
-        logger.debug("Stopping excluded chromecast %s", cast)
-        cast.socket_client.stop.set()
-
-    return list(filtered_cc)
-
-
-def get_chromecasts_as_dict(tries=None, retry_wait=None, timeout=None,
-                            **filters):
-    """
-    Returns a dictionary of chromecasts with the friendly name as
-    the key.  The value is the pychromecast object itself.
-
-    Tries is specified if you want to limit the number of times the
-    underlying socket associated with your Chromecast objects will
-    retry connecting if connection is lost or it fails to connect
-    in the first place. The number of seconds spent between each retry
-    can be defined by passing the retry_wait parameter, the default is
-    to wait 5 seconds.
-    """
-    return {cc.device.friendly_name: cc
-            for cc in get_chromecasts(tries=tries, retry_wait=retry_wait,
-                                      timeout=timeout,
-                                      **filters)}
-
-
-def get_chromecast(strict=False, tries=None, retry_wait=None, timeout=None,
-                   **filters):
-    """
-    Same as get_chromecasts but only if filter matches exactly one
-    ChromeCast.
-
-    Returns a Chromecast matching exactly the fitler specified.
-
-    If strict, return one and only one chromecast
-
-    Tries is specified if you want to limit the number of times the
-    underlying socket associated with your Chromecast objects will
-    retry connecting if connection is lost or it fails to connect
-    in the first place. The number of seconds spent between each retry
-    can be defined by passing the retry_wait parameter, the default is
-    to wait 5 seconds.
-
-    :type retry_wait: float or None
-    """
-
-    # If we have filters or are operating in strict mode we have to scan
-    # for all Chromecasts to ensure there is only 1 matching chromecast.
-    # If no filters given and not strict just use the first dicsovered one.
-    if filters or strict:
-        results = get_chromecasts(tries=tries, retry_wait=retry_wait,
-                                  timeout=timeout,
-                                  **filters)
+    if blocking:
+        # Thread blocking chromecast discovery
+        hosts = discover_chromecasts()
+        cc_list = []
+        for host in hosts:
+            try:
+                cc_list.append(_get_chromecast_from_host(
+                    host, tries=tries, retry_wait=retry_wait, timeout=timeout,
+                    blocking=blocking))
+            except ChromecastConnectionError:  # noqa
+                pass
+        return cc_list
     else:
-        results = _get_all_chromecasts(tries, retry_wait)
+        # Callback based chromecast discovery
+        if not callable(callback):
+            raise ValueError(
+                "Nonblocking discovery requires a callback function.")
 
-    if len(results) > 1:
-        if strict:
-            raise MultipleChromecastsFoundError(
-                'More than one Chromecast was found specifying '
-                'the filter criteria: {}'.format(filters))
-        else:
-            return results[0]
+        def internal_callback(name):
+            """Called when zeroconf has discovered a new chromecast."""
+            try:
+                callback(_get_chromecast_from_host(
+                    listener.services[name], tries=tries,
+                    retry_wait=retry_wait, timeout=timeout, blocking=blocking))
+            except ChromecastConnectionError:  # noqa
+                pass
 
-    elif not results:
-        if strict:
-            raise NoChromecastFoundError(
-                'No Chromecasts matching filter critera were found:'
-                ' {}'.format(filters))
-        else:
-            return None
+        def internal_stop():
+            """Stops discovery of new chromecasts."""
+            stop_discovery(browser)
 
-    else:
-        return results[0]
+        listener, browser = start_discovery(internal_callback)
+        return internal_stop
 
 
 # pylint: disable=too-many-instance-attributes
@@ -204,6 +128,7 @@ class Chromecast(object):
         tries = kwargs.pop('tries', None)
         timeout = kwargs.pop('timeout', None)
         retry_wait = kwargs.pop('retry_wait', None)
+        blocking = kwargs.pop('blocking', True)
 
         self.logger = logging.getLogger(__name__)
 
@@ -240,7 +165,7 @@ class Chromecast(object):
             self.device = get_device_status(self.host)
 
         if not self.device:
-            raise ChromecastConnectionError(
+            raise ChromecastConnectionError(  # noqa
                 "Could not connect to {}:{}".format(self.host, self.port))
 
         self.status = None
@@ -248,7 +173,8 @@ class Chromecast(object):
 
         self.socket_client = socket_client.SocketClient(
             host, port=port, cast_type=self.device.cast_type,
-            tries=tries, timeout=timeout, retry_wait=retry_wait)
+            tries=tries, timeout=timeout, retry_wait=retry_wait,
+            blocking=blocking)
 
         receiver_controller = self.socket_client.receiver_controller
         receiver_controller.register_status_listener(self)
@@ -265,7 +191,8 @@ class Chromecast(object):
         self.register_connection_listener = \
             self.socket_client.register_connection_listener
 
-        self.socket_client.start()
+        if blocking:
+            self.socket_client.start()
 
     @property
     def ignore_cec(self):
@@ -349,20 +276,24 @@ class Chromecast(object):
         """ Reboots the Chromecast. """
         reboot(self.host)
 
-    def volume_up(self):
-        """ Increment volume by 0.1 unless it is already maxed.
+    def volume_up(self, delta=0.1):
+        """ Increment volume by 0.1 (or delta) unless it is already maxed.
         Returns the new volume.
 
         """
-        volume = round(self.status.volume_level, 1)
-        return self.set_volume(volume + 0.1)
+        if delta <= 0:
+            raise ValueError(
+                "volume delta must be greater than zero, not {}".format(delta))
+        return self.set_volume(self.status.volume_level + delta)
 
-    def volume_down(self):
-        """ Decrement the volume by 0.1 unless it is already 0.
+    def volume_down(self, delta=0.1):
+        """ Decrement the volume by 0.1 (or delta) unless it is already 0.
         Returns the new volume.
         """
-        volume = round(self.status.volume_level, 1)
-        return self.set_volume(volume - 0.1)
+        if delta <= 0:
+            raise ValueError(
+                "volume delta must be greater than zero, not {}".format(delta))
+        return self.set_volume(self.status.volume_level - delta)
 
     def wait(self, timeout=None):
         """
@@ -404,7 +335,10 @@ class Chromecast(object):
         self.socket_client.join(timeout=timeout)
 
     def __del__(self):
-        self.socket_client.stop.set()
+        try:
+            self.socket_client.stop.set()
+        except AttributeError:
+            pass
 
     def __repr__(self):
         txt = u"Chromecast({!r}, port={!r}, device={!r})".format(

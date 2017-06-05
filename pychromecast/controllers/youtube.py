@@ -11,7 +11,7 @@ ATTR_SCREEN_ID = "screenId"
 
 
 class YouTubeController(BaseController):
-    """ Controller to interact with Plex namespace. """
+    """ Controller to interact with Youtube namespace. """
 
     def __init__(self):
         super(YouTubeController, self).__init__(
@@ -35,8 +35,16 @@ class YouTubeController(BaseController):
 
         Only works if there is no video playing.
         """
-        self.launch()
+        def callback():
+            """Plays requested video after app launched."""
+            self.start_play(youtube_id)
 
+        self.launch(callback)
+
+    def start_play(self, youtube_id):
+        """
+        Sends the play message to the YouTube app.
+        """
         msg = {
             "type": "flingVideo",
             "data": {
