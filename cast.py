@@ -83,7 +83,8 @@ def resolve_name(name, max_depth, args):
 			filetype = source.info()["content-type"]
 			url = source.geturl()
 			if filetype in supportedtypes:
-				yield (url, filetype, None, None)
+				handle = str(uuid.uuid4())
+				yield (url, filetype, handle, None)
 				return
 
 	# youtube link or ID
@@ -95,7 +96,8 @@ def resolve_name(name, max_depth, args):
 			# make sure video with youtube_id exists
 			with contextlib.closing(urllib2.urlopen("https://youtube.com/oembed?url=https://youtube.com/watch?v={0}".format(youtube_id))) as exists:
 				if exists.getcode() == 200:
-					yield (youtube_id, "youtube", None, None)
+					handle = str(uuid.uuid4())
+					yield (youtube_id, "youtube", handle, None)
 					return
 		except urllib2.HTTPError as error:
 			print("Failed to verify YouTube video exists: {0}".format(error))
@@ -132,6 +134,11 @@ def cast(args):
 	import threading
 	import time
 
+	# Treat SIGTERM like Ctrl-C
+	def handle_signal(signum, frame):
+		if (signum == signal.SIGTERM): raise KeyboardInterrupt("Caught SIGTERM; shutting down")
+	signal.signal(signal.SIGTERM, handle_signal)
+
 	# todo: blocking=False
 	(cast,) = (cc for cc in pychromecast.get_chromecasts()
 	           if args.device is None or args.device == cc.device.friendly_name)
@@ -140,32 +147,29 @@ def cast(args):
 	#yt_controller = pychromecast.controllers.youtube.YouTubeController()
 	#cast.register_handler(yt_controller)
 
-	media = [] # list of (url, filetype)
 	files = {} # dict of handle : (filepath, filetype)
 	max_depth = args.recursive or 0
 
-	for name in args.names:
-		for (url, filetype, handle, filepath) in resolve_name(name, max_depth, args):
-			media += [(url, filetype)]
-			if filepath is not None and handle is not None:
-				files[handle] = (filepath, filetype)
+	def resolve_names():
+		for name in args.names:
+			for result in resolve_name(name, max_depth, args):
+				yield result
 
-	httpd = None
-	if len(files) > 0:
+	def start_httpd():
 		def build_stream(*h_args):
 			StreamHTTP(files, *h_args)
-		httpd = HTTPServer((args.host, args.port), build_stream)
-		threading.Thread(target=httpd.serve_forever).start()
+		local_httpd = HTTPServer((args.host, args.port), build_stream)
+		threading.Thread(target=local_httpd.serve_forever).start()
+		return local_httpd
 
-	# Treat SIGTERM like Ctrl-C
-	def handle_signal(signum, frame):
-		if (signum == signal.SIGTERM):
-			raise KeyboardInterrupt("Caught SIGTERM; shutting down")
-	signal.signal(signal.SIGTERM, handle_signal)
-
+	httpd = None
 	try:
-		for (url, filetype) in media:
-			print("Casting {0} ({1}) to {2}".format(url, filetype, cast))
+		for (url, filetype, handle, filepath) in resolve_names():
+			if filepath is not None:
+				httpd = httpd or start_httpd()
+				files[handle] = (filepath, filetype)
+
+			print("Casting {0} [{1}] to {2}".format(filepath or url, filetype, cast))
 
 			if filetype == "youtube":
 				print("Skipping YouTube video")
@@ -184,6 +188,10 @@ def cast(args):
 
 				controller.register_status_listener(status_listener())
 				controller.play_media(url, filetype)
+
+				# workaround: controller doesn't go to idle state after images
+				if filetype.startswith("image/"):
+					completion.set()
 
 				# poll so signal handlers still work
 				while not completion.wait(0.5):
